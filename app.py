@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify
+import sendgrid
+from sendgrid.helpers.mail import Mail
 
 app = Flask(__name__)
 
