@@ -401,6 +401,69 @@ def revoca():
 # Inizializza DB all'avvio (funziona anche con Gunicorn)
 init_db()
 
+import hmac
+import hashlib
+
+LEMONSQUEEZY_SECRET = os.environ.get("LEMONSQUEEZY_SECRET", "")
+
+@app.route("/webhook/lemonsqueezy", methods=["POST"])
+def webhook_lemonsqueezy():
+    """
+    Riceve eventi da LemonSqueezy e genera licenze automaticamente.
+    Eventi gestiti: order_created, subscription_created
+    """
+    # Verifica firma
+    signature = request.headers.get("X-Signature", "")
+    body      = request.get_data()
+    expected  = hmac.new(
+        LEMONSQUEEZY_SECRET.encode(),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected):
+        return jsonify({"errore": "Firma non valida"}), 401
+
+    evento = request.json
+    tipo   = evento.get("meta", {}).get("event_name", "")
+
+    if tipo in ("order_created", "subscription_created"):
+        dati     = evento.get("data", {}).get("attributes", {})
+        email    = dati.get("user_email", "")
+        prodotto = dati.get("product_name", "").lower()
+
+        # Determina il piano
+        if "enterprise" in prodotto:
+            piano = "enterprise"
+        elif "pro" in prodotto:
+            piano = "pro"
+        else:
+            piano = "starter"
+
+        if email:
+            chiave = genera_chiave(email, piano)
+            oggi   = datetime.now()
+            scad   = oggi + timedelta(days=365)
+
+            conn = get_db()
+            try:
+                # Disattiva licenze precedenti
+                conn.execute(
+                    "UPDATE licenze SET attiva=0 WHERE email=? AND attiva=1", (email,))
+                conn.execute("""
+                    INSERT INTO licenze
+                    (chiave, piano, email, data_attivazione, data_scadenza, attiva, trial, created_at)
+                    VALUES (?,?,?,?,?,1,0,?)
+                """, (chiave, piano, email,
+                      oggi.date().isoformat(),
+                      scad.date().isoformat(),
+                      oggi.isoformat()))
+                conn.commit()
+            finally:
+                conn.close()
+
+    return jsonify({"status": "ok"}), 200
+
 if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 5000))
