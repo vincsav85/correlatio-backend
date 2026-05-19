@@ -464,7 +464,57 @@ def webhook_lemonsqueezy():
             finally:
                 conn.close()
 
+    # Invia email con la chiave al cliente
+            _invia_email_licenza(email, chiave, piano)
+
     return jsonify({"status": "ok"}), 200
+
+
+def _invia_email_licenza(email: str, chiave: str, piano: str):
+    """Invia la chiave licenza via email al cliente tramite SendGrid."""
+    try:
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get("SENDGRID_API_KEY"))
+        
+        nomi_piani = {
+            "starter":    "Starter — €29/mese",
+            "pro":        "Pro — €79/mese",
+            "enterprise": "Enterprise — €129/mese",
+        }
+        nome_piano = nomi_piani.get(piano, piano.capitalize())
+
+        contenuto = f"""
+Benvenuto in Correlatio!
+
+Il tuo acquisto è confermato. Ecco la tua chiave licenza:
+
+    {chiave}
+
+Piano attivato: {nome_piano}
+Durata: 12 mesi
+
+Come usare la chiave:
+1. Apri Correlatio
+2. Se è la tua prima installazione, inserisci la tua email per il trial
+3. Clicca "Ho già una chiave licenza"
+4. Inserisci la chiave qui sopra
+
+Per assistenza: info@correlatio.it
+
+Grazie per aver scelto Correlatio.
+Dove le esigenze incontrano le soluzioni.
+        """.strip()
+
+        messaggio = Mail(
+            from_email="noreply@correlatio.it",
+            to_emails=email,
+            subject="La tua licenza Correlatio",
+            plain_text_content=contenuto
+        )
+        sg.send(messaggio)
+        print(f"Email inviata a {email}")
+
+    except Exception as e:
+        print(f"Errore invio email: {e}")
 
 if __name__ == "__main__":
     
