@@ -542,3 +542,89 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+# ---------------------------------------------------------------------------
+# Webhook Stripe
+# ---------------------------------------------------------------------------
+
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+@app.route('/webhook', methods=['POST'])
+def webhook_stripe():
+    """Riceve eventi da Stripe e gestisce licenze automaticamente."""
+    try:
+        import stripe
+        payload    = request.get_data()
+        sig_header = request.headers.get('Stripe-Signature', '')
+        evento = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        print(f'Webhook Stripe errore firma: {e}')
+        return jsonify({'errore': 'Firma non valida'}), 400
+
+    tipo = evento.get('type', '')
+    print(f'Stripe evento: {tipo}')
+
+    if tipo == 'checkout.session.completed':
+        session = evento['data']['object']
+        email   = (session.get('customer_details') or {}).get('email', '') or session.get('customer_email', '')
+        metadata = session.get('metadata', {})
+        piano = metadata.get('piano', 'starter')
+        if email:
+            chiave = genera_chiave(email, piano)
+            oggi   = datetime.now()
+            scad   = oggi + timedelta(days=365)
+            conn   = get_db()
+            try:
+                conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND attiva=1', (email,))
+                conn.execute(
+                    'INSERT INTO licenze (chiave, piano, email, data_attivazione, data_scadenza, attiva, trial, created_at) VALUES (?,?,?,?,?,1,0,?)',
+                    (chiave, piano, email, oggi.date().isoformat(), scad.date().isoformat(), oggi.isoformat())
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            _invia_email_licenza(email, chiave, piano)
+            print(f'Licenza {piano} creata per {email}: {chiave}')
+
+    elif tipo == 'customer.subscription.deleted':
+        sub   = evento['data']['object']
+        email = (sub.get('metadata') or {}).get('email', '')
+        if not email:
+            try:
+                import stripe as _stripe
+                _stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
+                customer = _stripe.Customer.retrieve(sub.get('customer', ''))
+                email = customer.get('email', '')
+            except Exception:
+                pass
+        if email:
+            conn = get_db()
+            conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND trial=0 AND attiva=1', (email,))
+            conn.commit()
+            conn.close()
+            print(f'Licenza disattivata per {email}')
+
+    elif tipo == 'invoice.payment_failed':
+        invoice = evento['data']['object']
+        email   = invoice.get('customer_email', '')
+        if email:
+            conn = get_db()
+            conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND trial=0 AND attiva=1', (email,))
+            conn.commit()
+            conn.close()
+            print(f'Licenza disattivata per {email} — pagamento fallito')
+
+    elif tipo == 'invoice.payment_succeeded':
+        invoice = evento['data']['object']
+        email   = invoice.get('customer_email', '')
+        if email and invoice.get('billing_reason') == 'subscription_cycle':
+            conn = get_db()
+            conn.execute('UPDATE licenze SET attiva=1 WHERE email=? AND trial=0', (email,))
+            conn.commit()
+            conn.close()
+            print(f'Licenza riattivata per {email} — rinnovo')
+
+    return jsonify({'status': 'ok'}), 200
