@@ -429,6 +429,28 @@ def webhook_lemonsqueezy():
     evento = request.json
     tipo   = evento.get("meta", {}).get("event_name", "")
 
+    if tipo in ("subscription_cancelled", "subscription_expired",
+                "subscription_payment_failed", "subscription_payment_recovered"):
+        dati  = evento.get("data", {}).get("attributes", {})
+        email = dati.get("user_email", "") or dati.get("customer_email", "")
+        if email:
+            conn = get_db()
+            if tipo in ("subscription_cancelled", "subscription_expired",
+                        "subscription_payment_failed"):
+                conn.execute(
+                    "UPDATE licenze SET attiva=0 WHERE email=? AND trial=0 AND attiva=1",
+                    (email,))
+                print(f"Licenza disattivata per {email} — evento: {tipo}")
+            elif tipo == "subscription_payment_recovered":
+                # Pagamento recuperato — riattiva la licenza
+                conn.execute(
+                    "UPDATE licenze SET attiva=1 WHERE email=? AND trial=0",
+                    (email,))
+                print(f"Licenza riattivata per {email} — pagamento recuperato")
+            conn.commit()
+            conn.close()
+            
+
     if tipo in ("order_created", "subscription_created"):
         dati     = evento.get("data", {}).get("attributes", {})
         email    = dati.get("user_email", "")
