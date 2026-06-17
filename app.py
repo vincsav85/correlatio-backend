@@ -5,16 +5,22 @@ API Flask per la gestione delle licenze software.
 Deployato su Railway.
 
 Endpoints:
-    POST /activate      → Attiva una nuova licenza
-    POST /validate      → Valida una licenza esistente
-    POST /trial         → Crea un trial di 30 giorni
-    GET  /health        → Health check
-    GET  /admin/licenses → Lista tutte le licenze (protetto da ADMIN_KEY)
+    POST /activate          → Attiva una nuova licenza
+    POST /validate           → Valida una licenza esistente
+    POST /trial               → Crea un trial di 30 giorni
+    GET  /health             → Health check
+    GET  /admin/licenses    → Lista tutte le licenze (protetto da ADMIN_KEY)
+    POST /sync                → Riceve i dati dal Desktop per l'app mobile
+    GET  /mobile/dashboard  → Dati dashboard per l'app mobile
+    GET  /mobile/fatture     → Dati fatture per l'app mobile
+    GET  /mobile/scadenze   → Dati scadenze per l'app mobile
+    GET  /mobile/magazzino  → Dati magazzino per l'app mobile
 """
 
 import os
 import uuid
 import hashlib
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from functools import wraps
@@ -28,16 +34,15 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Configurazione
 # ---------------------------------------------------------------------------
-
-DB_PATH    = os.environ.get("DB_PATH", "licenses.db")
-ADMIN_KEY  = os.environ.get("ADMIN_KEY", "cambia-questa-chiave-in-produzione")
+DB_PATH = os.environ.get("DB_PATH", "licenses.db")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "cambia-questa-chiave-in-produzione")
 SECRET_KEY = os.environ.get("SECRET_KEY", "correlatio-secret-2026")
 
 PIANI = {
-    "trial":      {"nome": "Trial 30 giorni", "giorni": 30},
-    "starter":    {"nome": "Starter",         "giorni": 365},
-    "pro":        {"nome": "Pro",             "giorni": 365},
-    "enterprise": {"nome": "Enterprise",      "giorni": 365},
+    "trial": {"nome": "Trial 30 giorni", "giorni": 30},
+    "starter": {"nome": "Starter", "giorni": 365},
+    "pro": {"nome": "Pro", "giorni": 365},
+    "enterprise": {"nome": "Enterprise", "giorni": 365},
 }
 
 # Funzionalità per piano
@@ -73,36 +78,55 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     conn = get_db()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS licenze (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            chiave          TEXT UNIQUE NOT NULL,
-            piano           TEXT NOT NULL DEFAULT 'trial',
-            email           TEXT,
-            nome_azienda    TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chiave TEXT UNIQUE NOT NULL,
+            piano TEXT NOT NULL DEFAULT 'trial',
+            email TEXT,
+            nome_azienda TEXT,
             data_attivazione TEXT NOT NULL,
-            data_scadenza   TEXT NOT NULL,
-            attiva          INTEGER DEFAULT 1,
-            trial           INTEGER DEFAULT 0,
-            note            TEXT,
-            created_at      TEXT NOT NULL
+            data_scadenza TEXT NOT NULL,
+            attiva INTEGER DEFAULT 1,
+            trial INTEGER DEFAULT 0,
+            note TEXT,
+            created_at TEXT NOT NULL
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS validazioni (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chiave      TEXT NOT NULL,
-            ip          TEXT,
-            esito       TEXT,
-            timestamp   TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chiave TEXT NOT NULL,
+            ip TEXT,
+            esito TEXT,
+            timestamp TEXT NOT NULL
         )
     """)
+
+    # NUOVA TABELLA — sincronizzazione dati per l'app mobile.
+    # Una sola riga per azienda (chiave UNIQUE): ogni sync sovrascrive
+    # la precedente, non serve uno storico.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sync_dati (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chiave TEXT UNIQUE NOT NULL,
+            dashboard TEXT,
+            fatture TEXT,
+            scadenze TEXT,
+            magazzino TEXT,
+            ultima_sync TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     print("Database inizializzato.")
+
 
 # ---------------------------------------------------------------------------
 # Utilità
@@ -115,6 +139,7 @@ def genera_chiave(email: str, piano: str) -> str:
     # Formato: CORR-XXXX-XXXX-XXXX
     return f"CORR-{hash_val[:4]}-{hash_val[4:8]}-{hash_val[8:12]}"
 
+
 def log_validazione(chiave: str, ip: str, esito: str):
     """Registra ogni tentativo di validazione."""
     conn = get_db()
@@ -125,6 +150,7 @@ def log_validazione(chiave: str, ip: str, esito: str):
     conn.commit()
     conn.close()
 
+
 def richiede_admin(f):
     """Decorator per proteggere gli endpoint admin."""
     @wraps(f)
@@ -134,6 +160,63 @@ def richiede_admin(f):
             return jsonify({"errore": "Non autorizzato"}), 401
         return f(*args, **kwargs)
     return decorated
+
+
+def _licenza_valida_e_attiva(chiave: str) -> bool:
+    """
+    NUOVA FUNZIONE — verifica rapida per gli endpoint mobile:
+    la chiave esiste, è attiva e non è scaduta.
+    """
+    if not chiave:
+        return False
+    conn = get_db()
+    lic = conn.execute(
+        "SELECT * FROM licenze WHERE chiave=?", (chiave,)
+    ).fetchone()
+    conn.close()
+    if not lic or not lic["attiva"]:
+        return False
+    try:
+        scadenza = datetime.fromisoformat(lic["data_scadenza"])
+    except ValueError:
+        return False
+    return scadenza >= datetime.now()
+
+
+def richiede_licenza_valida(f):
+    """
+    NUOVA FUNZIONE — decorator per gli endpoint /mobile/*.
+    La chiave licenza va passata nell'header X-License-Key.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        chiave = request.headers.get("X-License-Key", "").strip().upper()
+        if not _licenza_valida_e_attiva(chiave):
+            return jsonify({"errore": "Chiave licenza non valida o non attiva"}), 401
+        request.chiave_licenza = chiave
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _leggi_sezione_sync(chiave: str, colonna: str):
+    """
+    NUOVA FUNZIONE — legge una singola sezione (dashboard/fatture/
+    scadenze/magazzino) per la chiave data.
+    Restituisce (dati, ultima_sync) oppure (None, None) se non è mai
+    stata fatta una sync per questa azienda.
+    """
+    conn = get_db()
+    riga = conn.execute(
+        f"SELECT {colonna}, ultima_sync FROM sync_dati WHERE chiave=?", (chiave,)
+    ).fetchone()
+    conn.close()
+
+    if not riga:
+        return None, None
+
+    valore = json.loads(riga[colonna]) if riga[colonna] else {}
+    return valore, riga["ultima_sync"]
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -184,8 +267,8 @@ def crea_trial():
         return jsonify({"errore": "Trial già attivato per questa email"}), 409
 
     chiave = genera_chiave(email, "trial")
-    oggi   = datetime.now()
-    scad   = oggi + timedelta(days=30)
+    oggi = datetime.now()
+    scad = oggi + timedelta(days=30)
 
     conn.execute("""
         INSERT INTO licenze
@@ -202,14 +285,14 @@ def crea_trial():
     conn.close()
 
     return jsonify({
-        "successo":     True,
-        "chiave":       chiave,
-        "piano":        "trial",
-        "nome_piano":   "Trial 30 giorni",
-        "scadenza":     scad.date().isoformat(),
-        "giorni":       30,
+        "successo": True,
+        "chiave": chiave,
+        "piano": "trial",
+        "nome_piano": "Trial 30 giorni",
+        "scadenza": scad.date().isoformat(),
+        "giorni": 30,
         "funzionalita": FUNZIONALITA["trial"],
-        "messaggio":    "Trial attivato! Hai 30 giorni per esplorare Correlatio."
+        "messaggio": "Trial attivato! Hai 30 giorni per esplorare Correlatio."
     }), 201
 
 
@@ -229,15 +312,15 @@ def valida():
         funzionalita : Lista funzionalità abilitate
         trial        : True se è un trial
     """
-    dati   = request.get_json() or {}
+    dati = request.get_json() or {}
     chiave = dati.get("chiave", "").strip().upper()
-    ip     = request.remote_addr
+    ip = request.remote_addr
 
     if not chiave:
         return jsonify({"errore": "Chiave obbligatoria"}), 400
 
-    conn   = get_db()
-    lic    = conn.execute(
+    conn = get_db()
+    lic = conn.execute(
         "SELECT * FROM licenze WHERE chiave=?", (chiave,)
     ).fetchone()
     conn.close()
@@ -245,48 +328,48 @@ def valida():
     if not lic:
         log_validazione(chiave, ip, "non_trovata")
         return jsonify({
-            "valida":   False,
-            "errore":   "Chiave non trovata",
+            "valida": False,
+            "errore": "Chiave non trovata",
             "messaggio": "Chiave licenza non valida."
         }), 404
 
     if not lic["attiva"]:
         log_validazione(chiave, ip, "disattivata")
         return jsonify({
-            "valida":   False,
-            "errore":   "Licenza disattivata",
+            "valida": False,
+            "errore": "Licenza disattivata",
             "messaggio": "Questa licenza è stata disattivata."
         }), 403
 
-    scadenza     = datetime.fromisoformat(lic["data_scadenza"])
-    oggi         = datetime.now()
+    scadenza = datetime.fromisoformat(lic["data_scadenza"])
+    oggi = datetime.now()
     giorni_rimasti = (scadenza - oggi).days
 
     if giorni_rimasti < 0:
         log_validazione(chiave, ip, "scaduta")
         return jsonify({
-            "valida":    False,
-            "errore":    "Licenza scaduta",
+            "valida": False,
+            "errore": "Licenza scaduta",
             "messaggio": f"La licenza è scaduta il {lic['data_scadenza']}.",
-            "scadenza":  lic["data_scadenza"],
-            "piano":     lic["piano"],
-            "trial":     bool(lic["trial"]),
+            "scadenza": lic["data_scadenza"],
+            "piano": lic["piano"],
+            "trial": bool(lic["trial"]),
         }), 403
 
     piano = lic["piano"]
     log_validazione(chiave, ip, "valida")
 
     return jsonify({
-        "valida":        True,
-        "piano":         piano,
-        "nome_piano":    PIANI.get(piano, {}).get("nome", piano),
-        "scadenza":      lic["data_scadenza"],
-        "giorni":        max(0, giorni_rimasti),
-        "trial":         bool(lic["trial"]),
-        "email":         lic["email"],
-        "nome_azienda":  lic["nome_azienda"],
-        "funzionalita":  FUNZIONALITA.get(piano, []),
-        "messaggio":     "Licenza valida."
+        "valida": True,
+        "piano": piano,
+        "nome_piano": PIANI.get(piano, {}).get("nome", piano),
+        "scadenza": lic["data_scadenza"],
+        "giorni": max(0, giorni_rimasti),
+        "trial": bool(lic["trial"]),
+        "email": lic["email"],
+        "nome_azienda": lic["nome_azienda"],
+        "funzionalita": FUNZIONALITA.get(piano, []),
+        "messaggio": "Licenza valida."
     })
 
 
@@ -302,11 +385,11 @@ def attiva():
         admin_key    : Chiave admin (obbligatoria per creare licenze)
 
     Returns:
-        chiave       : Nuova chiave licenza
-        piano        : Piano attivato
-        scadenza     : Data scadenza (1 anno)
+        chiave   : Nuova chiave licenza
+        piano    : Piano attivato
+        scadenza : Data scadenza (1 anno)
     """
-    dati      = request.get_json() or {}
+    dati = request.get_json() or {}
     admin_key = dati.get("admin_key", "")
 
     if admin_key != ADMIN_KEY:
@@ -325,16 +408,14 @@ def attiva():
         return jsonify({"errore": "Usa /trial per creare un trial"}), 400
 
     chiave = genera_chiave(email, piano)
-    oggi   = datetime.now()
-    scad   = oggi + timedelta(days=365)
+    oggi = datetime.now()
+    scad = oggi + timedelta(days=365)
 
     conn = get_db()
-
     # Disattiva eventuali licenze precedenti per questa email
     conn.execute(
         "UPDATE licenze SET attiva=0 WHERE email=? AND attiva=1", (email,)
     )
-
     conn.execute("""
         INSERT INTO licenze
         (chiave, piano, email, nome_azienda, data_attivazione, data_scadenza, attiva, trial, created_at)
@@ -350,15 +431,15 @@ def attiva():
     conn.close()
 
     return jsonify({
-        "successo":    True,
-        "chiave":      chiave,
-        "piano":       piano,
-        "nome_piano":  PIANI[piano]["nome"],
-        "email":       email,
-        "scadenza":    scad.date().isoformat(),
-        "giorni":      365,
+        "successo": True,
+        "chiave": chiave,
+        "piano": piano,
+        "nome_piano": PIANI[piano]["nome"],
+        "email": email,
+        "scadenza": scad.date().isoformat(),
+        "giorni": 365,
         "funzionalita": FUNZIONALITA[piano],
-        "messaggio":   f"Licenza {PIANI[piano]['nome']} attivata con successo."
+        "messaggio": f"Licenza {PIANI[piano]['nome']} attivata con successo."
     }), 201
 
 
@@ -366,12 +447,11 @@ def attiva():
 @richiede_admin
 def lista_licenze():
     """Lista tutte le licenze — solo admin."""
-    conn  = get_db()
-    lics  = conn.execute(
+    conn = get_db()
+    lics = conn.execute(
         "SELECT * FROM licenze ORDER BY created_at DESC"
     ).fetchall()
     conn.close()
-
     return jsonify({
         "totale": len(lics),
         "licenze": [dict(l) for l in lics]
@@ -382,7 +462,7 @@ def lista_licenze():
 @richiede_admin
 def revoca():
     """Revoca una licenza — solo admin."""
-    dati   = request.get_json() or {}
+    dati = request.get_json() or {}
     chiave = dati.get("chiave", "").strip().upper()
 
     if not chiave:
@@ -396,6 +476,95 @@ def revoca():
     return jsonify({"successo": True, "messaggio": f"Licenza {chiave} revocata."})
 
 
+# =============================================================================
+# NUOVI ENDPOINT — Sincronizzazione mobile (Fase 2)
+# =============================================================================
+
+@app.route("/sync", methods=["POST"])
+def sync_dati_mobile():
+    """
+    Riceve dal Desktop il pacchetto calcolato da sync_mobile.py e lo salva,
+    sovrascrivendo il record precedente per la stessa chiave licenza.
+
+    Body JSON:
+        chiave    : chiave licenza (obbligatoria)
+        dashboard : dict
+        fatture   : dict
+        scadenze  : dict
+        magazzino : dict
+    """
+    dati = request.get_json() or {}
+    chiave = dati.get("chiave", "").strip().upper()
+
+    if not _licenza_valida_e_attiva(chiave):
+        return jsonify({"errore": "Chiave licenza non valida o non attiva"}), 401
+
+    ora = datetime.now().isoformat()
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO sync_dati (chiave, dashboard, fatture, scadenze, magazzino, ultima_sync)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(chiave) DO UPDATE SET
+            dashboard=excluded.dashboard,
+            fatture=excluded.fatture,
+            scadenze=excluded.scadenze,
+            magazzino=excluded.magazzino,
+            ultima_sync=excluded.ultima_sync
+    """, (
+        chiave,
+        json.dumps(dati.get("dashboard", {})),
+        json.dumps(dati.get("fatture", {})),
+        json.dumps(dati.get("scadenze", {})),
+        json.dumps(dati.get("magazzino", {})),
+        ora,
+    ))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"successo": True, "ultima_sync": ora}), 200
+
+
+@app.route("/mobile/dashboard", methods=["GET"])
+@richiede_licenza_valida
+def mobile_dashboard():
+    """Restituisce l'ultimo riepilogo dashboard sincronizzato dal Desktop."""
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "dashboard")
+    if dati is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
+    return jsonify({**dati, "ultima_sync": ultima_sync})
+
+
+@app.route("/mobile/fatture", methods=["GET"])
+@richiede_licenza_valida
+def mobile_fatture():
+    """Restituisce le fatture attive e passive sincronizzate."""
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "fatture")
+    if dati is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
+    return jsonify({**dati, "ultima_sync": ultima_sync})
+
+
+@app.route("/mobile/scadenze", methods=["GET"])
+@richiede_licenza_valida
+def mobile_scadenze():
+    """Restituisce le scadenze urgenti e prossime sincronizzate."""
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "scadenze")
+    if dati is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
+    return jsonify({**dati, "ultima_sync": ultima_sync})
+
+
+@app.route("/mobile/magazzino", methods=["GET"])
+@richiede_licenza_valida
+def mobile_magazzino():
+    """Restituisce la situazione magazzino informativa sincronizzata."""
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "magazzino")
+    if dati is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
+    return jsonify({**dati, "ultima_sync": ultima_sync})
+
+
 # ---------------------------------------------------------------------------
 # Avvio
 # ---------------------------------------------------------------------------
@@ -404,9 +573,9 @@ def revoca():
 init_db()
 
 import hmac
-import hashlib
 
 LEMONSQUEEZY_SECRET = os.environ.get("LEMONSQUEEZY_SECRET", "")
+
 
 @app.route("/webhook/lemonsqueezy", methods=["POST"])
 def webhook_lemonsqueezy():
@@ -416,8 +585,8 @@ def webhook_lemonsqueezy():
     """
     # Verifica firma
     signature = request.headers.get("X-Signature", "")
-    body      = request.get_data()
-    expected  = hmac.new(
+    body = request.get_data()
+    expected = hmac.new(
         LEMONSQUEEZY_SECRET.encode(),
         body,
         hashlib.sha256
@@ -427,12 +596,13 @@ def webhook_lemonsqueezy():
         return jsonify({"errore": "Firma non valida"}), 401
 
     evento = request.json
-    tipo   = evento.get("meta", {}).get("event_name", "")
+    tipo = evento.get("meta", {}).get("event_name", "")
 
     if tipo in ("subscription_cancelled", "subscription_expired",
                 "subscription_payment_failed", "subscription_payment_recovered"):
-        dati  = evento.get("data", {}).get("attributes", {})
+        dati = evento.get("data", {}).get("attributes", {})
         email = dati.get("user_email", "") or dati.get("customer_email", "")
+
         if email:
             conn = get_db()
             if tipo in ("subscription_cancelled", "subscription_expired",
@@ -449,11 +619,10 @@ def webhook_lemonsqueezy():
                 print(f"Licenza riattivata per {email} — pagamento recuperato")
             conn.commit()
             conn.close()
-            
 
     if tipo in ("order_created", "subscription_created"):
-        dati     = evento.get("data", {}).get("attributes", {})
-        email    = dati.get("user_email", "")
+        dati = evento.get("data", {}).get("attributes", {})
+        email = dati.get("user_email", "")
         prodotto = dati.get("product_name", "").lower()
 
         # Determina il piano
@@ -466,8 +635,8 @@ def webhook_lemonsqueezy():
 
         if email:
             chiave = genera_chiave(email, piano)
-            oggi   = datetime.now()
-            scad   = oggi + timedelta(days=365)
+            oggi = datetime.now()
+            scad = oggi + timedelta(days=365)
 
             conn = get_db()
             try:
@@ -486,7 +655,7 @@ def webhook_lemonsqueezy():
             finally:
                 conn.close()
 
-    # Invia email con la chiave al cliente
+            # Invia email con la chiave al cliente
             _invia_email_licenza(email, chiave, piano)
 
     return jsonify({"status": "ok"}), 200
@@ -496,10 +665,10 @@ def _invia_email_licenza(email: str, chiave: str, piano: str):
     """Invia la chiave licenza via email al cliente tramite SendGrid."""
     try:
         sg = sendgrid.SendGridAPIClient(api_key=os.environ.get("SENDGRID_API_KEY"))
-        
+
         nomi_piani = {
-            "starter":    "Starter — €29/mese",
-            "pro":        "Pro — €79/mese",
+            "starter": "Starter — €29/mese",
+            "pro": "Pro — €79/mese",
             "enterprise": "Enterprise — €129/mese",
         }
         nome_piano = nomi_piani.get(piano, piano.capitalize())
@@ -509,7 +678,7 @@ Benvenuto in Correlatio!
 
 Il tuo acquisto è confermato. Ecco la tua chiave licenza:
 
-    {chiave}
+{chiave}
 
 Piano attivato: {nome_piano}
 Durata: 12 mesi
@@ -524,7 +693,7 @@ Per assistenza: info@correlatio.it
 
 Grazie per aver scelto Correlatio.
 Dove le esigenze incontrano le soluzioni.
-        """.strip()
+""".strip()
 
         messaggio = Mail(
             from_email="noreply@correlatio.it",
@@ -534,12 +703,11 @@ Dove le esigenze incontrano le soluzioni.
         )
         sg.send(messaggio)
         print(f"Email inviata a {email}")
-
     except Exception as e:
         print(f"Errore invio email: {e}")
 
+
 if __name__ == "__main__":
-    
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
 
@@ -550,12 +718,13 @@ if __name__ == "__main__":
 
 STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 
+
 @app.route('/webhook', methods=['POST'])
 def webhook_stripe():
     """Riceve eventi da Stripe e gestisce licenze automaticamente."""
     try:
         import stripe
-        payload    = request.get_data()
+        payload = request.get_data()
         sig_header = request.headers.get('Stripe-Signature', '')
         evento = stripe.Webhook.construct_event(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
@@ -569,14 +738,16 @@ def webhook_stripe():
 
     if tipo == 'checkout.session.completed':
         session = evento['data']['object']
-        email   = (session.get('customer_details') or {}).get('email', '') or session.get('customer_email', '')
+        email = (session.get('customer_details') or {}).get('email', '') or session.get('customer_email', '')
         metadata = session.get('metadata', {})
         piano = metadata.get('piano', 'starter')
+
         if email:
             chiave = genera_chiave(email, piano)
-            oggi   = datetime.now()
-            scad   = oggi + timedelta(days=365)
-            conn   = get_db()
+            oggi = datetime.now()
+            scad = oggi + timedelta(days=365)
+
+            conn = get_db()
             try:
                 conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND attiva=1', (email,))
                 conn.execute(
@@ -586,12 +757,14 @@ def webhook_stripe():
                 conn.commit()
             finally:
                 conn.close()
+
             _invia_email_licenza(email, chiave, piano)
             print(f'Licenza {piano} creata per {email}: {chiave}')
 
     elif tipo == 'customer.subscription.deleted':
-        sub   = evento['data']['object']
+        sub = evento['data']['object']
         email = (sub.get('metadata') or {}).get('email', '')
+
         if not email:
             try:
                 import stripe as _stripe
@@ -600,6 +773,7 @@ def webhook_stripe():
                 email = customer.get('email', '')
             except Exception:
                 pass
+
         if email:
             conn = get_db()
             conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND trial=0 AND attiva=1', (email,))
@@ -609,7 +783,8 @@ def webhook_stripe():
 
     elif tipo == 'invoice.payment_failed':
         invoice = evento['data']['object']
-        email   = invoice.get('customer_email', '')
+        email = invoice.get('customer_email', '')
+
         if email:
             conn = get_db()
             conn.execute('UPDATE licenze SET attiva=0 WHERE email=? AND trial=0 AND attiva=1', (email,))
@@ -619,7 +794,8 @@ def webhook_stripe():
 
     elif tipo == 'invoice.payment_succeeded':
         invoice = evento['data']['object']
-        email   = invoice.get('customer_email', '')
+        email = invoice.get('customer_email', '')
+
         if email and invoice.get('billing_reason') == 'subscription_cycle':
             conn = get_db()
             conn.execute('UPDATE licenze SET attiva=1 WHERE email=? AND trial=0', (email,))
