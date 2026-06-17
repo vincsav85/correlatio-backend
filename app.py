@@ -26,16 +26,10 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import sendgrid
 from sendgrid.helpers.mail import Mail
 
 app = Flask(__name__)
-
-# Permette alla PWA (app.correlatio.it) di chiamare gli endpoint /mobile/*
-# da un dominio diverso da quello del backend (web-production-...railway.app).
-# Limitato solo a questi endpoint, non a tutto il backend.
-CORS(app, resources={r"/mobile/*": {"origins": "*"}})
 
 # ---------------------------------------------------------------------------
 # Configurazione
