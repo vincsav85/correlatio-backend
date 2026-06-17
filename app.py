@@ -108,18 +108,21 @@ def init_db():
         )
     """)
 
-    # NUOVA TABELLA — sincronizzazione dati per l'app mobile.
-    # Una sola riga per azienda (chiave UNIQUE): ogni sync sovrascrive
-    # la precedente, non serve uno storico.
+    # TABELLA — sincronizzazione dati per l'app mobile.
+    # Una riga per ogni combinazione (chiave licenza + azienda), perché
+    # una licenza Enterprise può gestire più aziende: ognuna ha i suoi
+    # dati separati, mai mischiati tra loro.
     c.execute("""
         CREATE TABLE IF NOT EXISTS sync_dati (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chiave TEXT UNIQUE NOT NULL,
+            chiave TEXT NOT NULL,
+            azienda TEXT NOT NULL,
             dashboard TEXT,
             fatture TEXT,
             scadenze TEXT,
             magazzino TEXT,
-            ultima_sync TEXT NOT NULL
+            ultima_sync TEXT NOT NULL,
+            UNIQUE(chiave, azienda)
         )
     """)
 
@@ -197,25 +200,6 @@ def richiede_licenza_valida(f):
         return f(*args, **kwargs)
     return decorated
 
-
-def _leggi_sezione_sync(chiave: str, colonna: str):
-    """
-    NUOVA FUNZIONE — legge una singola sezione (dashboard/fatture/
-    scadenze/magazzino) per la chiave data.
-    Restituisce (dati, ultima_sync) oppure (None, None) se non è mai
-    stata fatta una sync per questa azienda.
-    """
-    conn = get_db()
-    riga = conn.execute(
-        f"SELECT {colonna}, ultima_sync FROM sync_dati WHERE chiave=?", (chiave,)
-    ).fetchone()
-    conn.close()
-
-    if not riga:
-        return None, None
-
-    valore = json.loads(riga[colonna]) if riga[colonna] else {}
-    return valore, riga["ultima_sync"]
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +468,12 @@ def revoca():
 def sync_dati_mobile():
     """
     Riceve dal Desktop il pacchetto calcolato da sync_mobile.py e lo salva,
-    sovrascrivendo il record precedente per la stessa chiave licenza.
+    sovrascrivendo il record precedente per la stessa combinazione di
+    chiave licenza + azienda (una licenza può gestire più aziende).
 
     Body JSON:
         chiave    : chiave licenza (obbligatoria)
+        azienda   : nome dell'azienda sincronizzata (obbligatorio)
         dashboard : dict
         fatture   : dict
         scadenze  : dict
@@ -495,17 +481,21 @@ def sync_dati_mobile():
     """
     dati = request.get_json() or {}
     chiave = dati.get("chiave", "").strip().upper()
+    azienda = dati.get("azienda", "").strip()
 
     if not _licenza_valida_e_attiva(chiave):
         return jsonify({"errore": "Chiave licenza non valida o non attiva"}), 401
+
+    if not azienda:
+        return jsonify({"errore": "Nome azienda obbligatorio"}), 400
 
     ora = datetime.now().isoformat()
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO sync_dati (chiave, dashboard, fatture, scadenze, magazzino, ultima_sync)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(chiave) DO UPDATE SET
+        INSERT INTO sync_dati (chiave, azienda, dashboard, fatture, scadenze, magazzino, ultima_sync)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(chiave, azienda) DO UPDATE SET
             dashboard=excluded.dashboard,
             fatture=excluded.fatture,
             scadenze=excluded.scadenze,
@@ -513,6 +503,7 @@ def sync_dati_mobile():
             ultima_sync=excluded.ultima_sync
     """, (
         chiave,
+        azienda,
         json.dumps(dati.get("dashboard", {})),
         json.dumps(dati.get("fatture", {})),
         json.dumps(dati.get("scadenze", {})),
@@ -522,47 +513,106 @@ def sync_dati_mobile():
     conn.commit()
     conn.close()
 
-    return jsonify({"successo": True, "ultima_sync": ora}), 200
+    return jsonify({"successo": True, "azienda": azienda, "ultima_sync": ora}), 200
+
+
+@app.route("/mobile/aziende", methods=["GET"])
+@richiede_licenza_valida
+def mobile_aziende():
+    """
+    Restituisce l'elenco delle aziende sincronizzate disponibili per
+    questa licenza — serve all'app mobile per mostrare il selettore
+    azienda prima di entrare nelle viste vere e proprie.
+    """
+    conn = get_db()
+    righe = conn.execute("""
+        SELECT azienda, ultima_sync FROM sync_dati
+        WHERE chiave = ?
+        ORDER BY azienda ASC
+    """, (request.chiave_licenza,)).fetchall()
+    conn.close()
+
+    aziende = [{"nome": r["azienda"], "ultima_sync": r["ultima_sync"]} for r in righe]
+    return jsonify({"aziende": aziende})
+
+
+def _leggi_sezione_sync(chiave: str, azienda: str, colonna: str):
+    """
+    Legge una singola sezione (dashboard/fatture/scadenze/magazzino) per
+    la combinazione chiave + azienda data.
+    Restituisce (dati, ultima_sync) oppure (None, None) se non è mai
+    stata fatta una sync per questa combinazione.
+    """
+    conn = get_db()
+    riga = conn.execute(
+        f"SELECT {colonna}, ultima_sync FROM sync_dati WHERE chiave=? AND azienda=?",
+        (chiave, azienda)
+    ).fetchone()
+    conn.close()
+
+    if not riga:
+        return None, None
+
+    valore = json.loads(riga[colonna]) if riga[colonna] else {}
+    return valore, riga["ultima_sync"]
+
+
+def _azienda_richiesta():
+    """Legge il nome azienda dalla query string (?azienda=...), obbligatorio."""
+    azienda = request.args.get("azienda", "").strip()
+    return azienda
 
 
 @app.route("/mobile/dashboard", methods=["GET"])
 @richiede_licenza_valida
 def mobile_dashboard():
-    """Restituisce l'ultimo riepilogo dashboard sincronizzato dal Desktop."""
-    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "dashboard")
+    """Restituisce l'ultimo riepilogo dashboard sincronizzato per l'azienda scelta."""
+    azienda = _azienda_richiesta()
+    if not azienda:
+        return jsonify({"errore": "Parametro azienda obbligatorio"}), 400
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, azienda, "dashboard")
     if dati is None:
-        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
-    return jsonify({**dati, "ultima_sync": ultima_sync})
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+    return jsonify({**dati, "azienda": azienda, "ultima_sync": ultima_sync})
 
 
 @app.route("/mobile/fatture", methods=["GET"])
 @richiede_licenza_valida
 def mobile_fatture():
-    """Restituisce le fatture attive e passive sincronizzate."""
-    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "fatture")
+    """Restituisce le fatture attive e passive sincronizzate per l'azienda scelta."""
+    azienda = _azienda_richiesta()
+    if not azienda:
+        return jsonify({"errore": "Parametro azienda obbligatorio"}), 400
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, azienda, "fatture")
     if dati is None:
-        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
-    return jsonify({**dati, "ultima_sync": ultima_sync})
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+    return jsonify({**dati, "azienda": azienda, "ultima_sync": ultima_sync})
 
 
 @app.route("/mobile/scadenze", methods=["GET"])
 @richiede_licenza_valida
 def mobile_scadenze():
-    """Restituisce le scadenze urgenti e prossime sincronizzate."""
-    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "scadenze")
+    """Restituisce le scadenze urgenti e prossime sincronizzate per l'azienda scelta."""
+    azienda = _azienda_richiesta()
+    if not azienda:
+        return jsonify({"errore": "Parametro azienda obbligatorio"}), 400
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, azienda, "scadenze")
     if dati is None:
-        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
-    return jsonify({**dati, "ultima_sync": ultima_sync})
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+    return jsonify({**dati, "azienda": azienda, "ultima_sync": ultima_sync})
 
 
 @app.route("/mobile/magazzino", methods=["GET"])
 @richiede_licenza_valida
 def mobile_magazzino():
-    """Restituisce la situazione magazzino informativa sincronizzata."""
-    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, "magazzino")
+    """Restituisce la situazione magazzino informativa sincronizzata per l'azienda scelta."""
+    azienda = _azienda_richiesta()
+    if not azienda:
+        return jsonify({"errore": "Parametro azienda obbligatorio"}), 400
+    dati, ultima_sync = _leggi_sezione_sync(request.chiave_licenza, azienda, "magazzino")
     if dati is None:
-        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora"}), 404
-    return jsonify({**dati, "ultima_sync": ultima_sync})
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+    return jsonify({**dati, "azienda": azienda, "ultima_sync": ultima_sync})
 
 
 # ---------------------------------------------------------------------------
