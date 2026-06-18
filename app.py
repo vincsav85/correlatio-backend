@@ -14,6 +14,8 @@ Endpoints:
     GET  /mobile/dashboard  → Dati dashboard per l'app mobile
     GET  /mobile/fatture     → Dati fatture per l'app mobile
     GET  /mobile/scadenze   → Dati scadenze per l'app mobile
+    POST /mobile/scadenze   → Inserisce una nuova scadenza manuale da mobile
+    PATCH /mobile/scadenze/<id> → Segna una scadenza manuale come pagata da mobile
     GET  /mobile/magazzino  → Dati magazzino per l'app mobile
 """
 
@@ -129,6 +131,20 @@ def init_db():
             magazzino TEXT,
             ultima_sync TEXT NOT NULL,
             UNIQUE(chiave, azienda)
+        )
+    """)
+
+    # NUOVA TABELLA — coda delle modifiche fatte da mobile (scadenze manuali),
+    # in attesa che il Desktop le scarichi e le applichi al DB locale.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS mobile_pending_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chiave TEXT NOT NULL,
+            azienda TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            creato_il TEXT NOT NULL,
+            sincronizzato INTEGER DEFAULT 0
         )
     """)
 
@@ -619,6 +635,114 @@ def mobile_magazzino():
     if dati is None:
         return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
     return jsonify({**dati, "azienda": azienda, "ultima_sync": ultima_sync})
+
+
+# =============================================================================
+# NUOVI ENDPOINT — Scrittura scadenze manuali da mobile (Fase 3)
+# =============================================================================
+# Solo le scadenze manuali sono scrivibili da mobile. Le scadenze generate
+# da fatture (fatture_attive/fatture_passive) restano di sola lettura: per
+# segnarle pagate bisogna cambiare lo stato della fattura, cosa che tocca
+# IVA/SDI e va fatta dal desktop con tutto il contesto.
+
+def _aggiorna_blob_scadenze(chiave, azienda, modifica):
+    """Legge il blob scadenze attuale, applica `modifica` (funzione), lo risalva."""
+    dati, _ = _leggi_sezione_sync(chiave, azienda, "scadenze")
+    if dati is None:
+        return None
+    dati = modifica(dati)
+    conn = get_db()
+    conn.execute(
+        "UPDATE sync_dati SET scadenze=? WHERE chiave=? AND azienda=?",
+        (json.dumps(dati), chiave, azienda)
+    )
+    conn.commit()
+    conn.close()
+    return dati
+
+
+@app.route("/mobile/scadenze", methods=["POST"])
+@richiede_licenza_valida
+def crea_scadenza_manuale_da_mobile():
+    """Inserisce una nuova scadenza manuale (solo questo tipo è scrivibile da mobile)."""
+    dati = request.get_json() or {}
+    azienda = dati.get("azienda", "").strip()
+    descrizione = dati.get("descrizione", "").strip()
+    importo = dati.get("importo")
+    data_scadenza = dati.get("data_scadenza", "").strip()
+
+    if not azienda or not descrizione or importo is None or not data_scadenza:
+        return jsonify({"errore": "azienda, descrizione, importo e data_scadenza sono obbligatori"}), 400
+
+    mobile_uuid = str(uuid.uuid4())
+    voce = {"descrizione": descrizione, "data": data_scadenza, "importo": round(float(importo), 2),
+            "origine": "manuale", "id": mobile_uuid}
+
+    soglia_urgenza = (datetime.now() + timedelta(days=7)).date().isoformat()
+
+    def aggiungi(blob):
+        lista = "urgenti" if data_scadenza <= soglia_urgenza else "prossime"
+        blob.setdefault(lista, []).append(voce)
+        blob[lista].sort(key=lambda x: x["data"])
+        return blob
+
+    aggiornato = _aggiorna_blob_scadenze(request.chiave_licenza, azienda, aggiungi)
+    if aggiornato is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO mobile_pending_changes (chiave, azienda, tipo, payload, creato_il) VALUES (?,?,?,?,?)",
+        (request.chiave_licenza, azienda, "nuova_scadenza_manuale",
+         json.dumps({"mobile_uuid": mobile_uuid, "descrizione": descrizione,
+                     "importo": round(float(importo), 2), "data_scadenza": data_scadenza}),
+         datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"successo": True, "id": mobile_uuid}), 201
+
+
+@app.route("/mobile/scadenze/<identificativo>", methods=["PATCH"])
+@richiede_licenza_valida
+def segna_scadenza_manuale_pagata(identificativo):
+    """Segna come pagata una scadenza manuale (rimossa dal blob, come fa il desktop)."""
+    dati = request.get_json() or {}
+    azienda = dati.get("azienda", "").strip()
+    data_pagamento = dati.get("data_pagamento") or datetime.now().date().isoformat()
+
+    if not azienda:
+        return jsonify({"errore": "azienda obbligatoria"}), 400
+
+    trovata = {"ok": False}
+
+    def rimuovi(blob):
+        for lista in ("urgenti", "prossime"):
+            originale = blob.get(lista, [])
+            filtrata = [v for v in originale if v.get("id") != identificativo]
+            if len(filtrata) != len(originale):
+                trovata["ok"] = True
+            blob[lista] = filtrata
+        return blob
+
+    aggiornato = _aggiorna_blob_scadenze(request.chiave_licenza, azienda, rimuovi)
+    if aggiornato is None:
+        return jsonify({"errore": "Nessuna sincronizzazione disponibile ancora per questa azienda"}), 404
+    if not trovata["ok"]:
+        return jsonify({"errore": "Scadenza non trovata (forse non è una scadenza manuale?)"}), 404
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO mobile_pending_changes (chiave, azienda, tipo, payload, creato_il) VALUES (?,?,?,?,?)",
+        (request.chiave_licenza, azienda, "scadenza_manuale_pagata",
+         json.dumps({"identificativo": identificativo, "data_pagamento": data_pagamento}),
+         datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"successo": True}), 200
 
 
 # ---------------------------------------------------------------------------
