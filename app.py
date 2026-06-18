@@ -745,6 +745,54 @@ def segna_scadenza_manuale_pagata(identificativo):
     return jsonify({"successo": True}), 200
 
 
+@app.route("/sync/pending-changes", methods=["GET"])
+def pending_changes():
+    """Il Desktop chiama questo per scaricare le modifiche fatte da mobile."""
+    chiave = request.args.get("chiave", "").strip().upper()
+    azienda = request.args.get("azienda", "").strip()
+
+    if not _licenza_valida_e_attiva(chiave):
+        return jsonify({"errore": "Chiave licenza non valida o non attiva"}), 401
+    if not azienda:
+        return jsonify({"errore": "Parametro azienda obbligatorio"}), 400
+
+    conn = get_db()
+    righe = conn.execute(
+        """SELECT id, tipo, payload, creato_il FROM mobile_pending_changes
+           WHERE chiave = ? AND azienda = ? AND sincronizzato = 0
+           ORDER BY id""",
+        (chiave, azienda)
+    ).fetchall()
+    conn.close()
+
+    return jsonify([
+        {"id": r["id"], "tipo": r["tipo"], "payload": json.loads(r["payload"]), "creato_il": r["creato_il"]}
+        for r in righe
+    ])
+
+
+@app.route("/sync/ack", methods=["POST"])
+def ack_changes():
+    """Il Desktop chiama questo dopo aver applicato le modifiche, per non riceverle due volte."""
+    dati = request.get_json() or {}
+    chiave = dati.get("chiave", "").strip().upper()
+    ids = dati.get("ids", [])
+
+    if not _licenza_valida_e_attiva(chiave):
+        return jsonify({"errore": "Chiave licenza non valida o non attiva"}), 401
+    if not ids:
+        return jsonify({"successo": True, "aggiornati": 0})
+
+    conn = get_db()
+    conn.executemany(
+        "UPDATE mobile_pending_changes SET sincronizzato = 1 WHERE id = ? AND chiave = ?",
+        [(i, chiave) for i in ids]
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"successo": True, "aggiornati": len(ids)})
+
+
 # ---------------------------------------------------------------------------
 # Avvio
 # ---------------------------------------------------------------------------
