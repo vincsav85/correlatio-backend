@@ -1,4 +1,5 @@
 """
+# build-fix-19giugno-ore10
 app.py — Backend licenze Correlatio
 
 API Flask per la gestione delle licenze software.
