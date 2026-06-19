@@ -529,7 +529,7 @@ def sync_dati_mobile():
         azienda,
         json.dumps(dati.get("dashboard", {})),
         json.dumps(dati.get("fatture", {})),
-        json.dumps(dati.get("scadenze", {})),
+        json.dumps(dati.get("scadenze") or {}),
         json.dumps(dati.get("magazzino", {})),
         ora,
     ))
@@ -577,6 +577,8 @@ def _leggi_sezione_sync(chiave: str, azienda: str, colonna: str):
         return None, None
 
     valore = json.loads(riga[colonna]) if riga[colonna] else {}
+    if valore is None:
+        valore = {}
     return valore, riga["ultima_sync"]
 
 
